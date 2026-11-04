@@ -10,6 +10,7 @@
   position     档位实际增量（k_T x k_L x k_V 三折扣）
   risk         组合风险贡献与等效单一标的仓位
   implied      给定增速反推市场隐含 PE
+  erp          股债模型：ERP、z 值、通道→点位映射、口径归因
 
 用法示例：
   python3 calc.py decompose --p0 4371.99 --pe0 55.145 --p1 2413.63 --pe1 26.908
@@ -20,6 +21,8 @@
   python3 calc.py position --incr 2 --kt 0.5 --kl 0.5 --kv 1.0
   python3 calc.py risk --w1 0.12 --s1 0.36 --w2 0.10 --s2 0.39 --rho 0.86
   python3 calc.py implied --cur 2413.63 --pe-now 26.91 --g 0.12
+  python3 calc.py erp --pe 13.52 --y10 1.634 --mu 5.68 --sd 1.19 --e 296.51 \
+      --alt-pe 12.9 --alt-mu 5.05 --alt-sd 1.05
 """
 
 import argparse
@@ -256,6 +259,76 @@ def cmd_implied(args):
           f"，差异 {_pct(pe_req / pe_now - 1)}")
 
 
+def _norm_cdf(z):
+    """标准正态 CDF，用于把 z 值翻成分位。"""
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def cmd_erp(args):
+    pe, y10, mu, sd = args.pe, args.y10, args.mu, args.sd
+    if pe <= 0:
+        sys.exit("错误：PE 必须为正数")
+    if sd <= 0:
+        sys.exit("错误：σ 必须为正数")
+
+    if args.e is not None:
+        e = args.e
+    elif args.level is not None:
+        e = args.level / pe
+    else:
+        sys.exit("错误：需给 --e（隐含盈利）或 --level（当前点位，E = level / PE）")
+
+    ey = 100.0 / pe
+    erp = ey - y10
+    z = (erp - mu) / sd
+    cur = e * pe
+
+    print(f"盈利收益率 = 100 / {pe:g} = {ey:.2f}%")
+    print(f"ERP = {ey:.2f}% − {y10:g}% = {erp:.2f}%")
+    print(f"z = ({erp:.2f} − {mu:g}) / {sd:g} = {z:+.2f}σ")
+    print(f"自身分布分位（正态近似）= {_norm_cdf(z) * 100:.1f}%")
+    if abs(z) <= 0.5:
+        print("提示：z 落在 ±0.5σ 临界区，不得单独作为决策依据——"
+              "须做口径归因（本命令的 --alt-* 参数）并与其他参照系交叉验证。")
+
+    print("\n通道 → 点位映射（E = %.2f，y10 = %g%% 固定）" % (e, y10))
+    rows = []
+    for k in (2.0, 1.5, 1.0, 0.0, -1.0, -2.0):
+        erp_t = mu + k * sd
+        pe_t = 100.0 / (erp_t + y10)
+        pt = e * pe_t
+        label = "μ" if k == 0 else f"{k:+g}σ"
+        rows.append([label, f"{erp_t:.2f}%", f"{pe_t:.2f}", f"{pt:,.0f}",
+                     _pct(pt / cur - 1), f"{z - k:+.2f}σ"])
+    print(_table(["通道", "ERP", "隐含 PE", "点位", "相对当前", "当前距该档"], rows))
+    print("读法：μ 那一行是公允价值点位。若它与当前价只差 1%–2%，"
+          "说明当前就在公允位置，不是买点。")
+    print("注意：E 每变动 1%，整条曲线同向平移 1%——买点是随盈利增长的移动靶。")
+    print("注意：σ 变化 0.1，+1σ 买点会移动百点级；点位精度只能到百点，不可当靶心。")
+
+    if args.alt_pe is not None or args.alt_mu is not None or args.alt_sd is not None:
+        ape = args.alt_pe if args.alt_pe is not None else pe
+        amu = args.alt_mu if args.alt_mu is not None else mu
+        asd = args.alt_sd if args.alt_sd is not None else sd
+        aey = 100.0 / ape
+        aerp = aey - y10
+        z0 = (aerp - amu) / asd
+        z1 = (erp - amu) / asd     # 先换 PE
+        z2 = (erp - mu) / asd      # 再换 μ
+        z3 = z                     # 最后换 σ
+        print("\n口径归因（宽松口径 → 严格口径，逐项替换，顺序 PE → μ → σ）")
+        rows = [
+            ["PE", f"{ape:g} → {pe:g}", f"ERP {aerp:.2f}% → {erp:.2f}%", f"{z1 - z0:+.2f}σ"],
+            ["μ", f"{amu:g} → {mu:g}", f"均值上移 {mu - amu:+.2f}pp", f"{z2 - z1:+.2f}σ"],
+            ["σ", f"{asd:g} → {sd:g}", f"离散度 {sd - asd:+.2f}pp", f"{z3 - z2:+.2f}σ"],
+            ["合计", f"z {z0:+.2f}σ → {z3:+.2f}σ", "—", f"{z3 - z0:+.2f}σ"],
+        ]
+        print(_table(["替换项", "取值", "说明", "对 z 的贡献"], rows))
+        print("校验：三项之和应等于合计（逐项替换，无交叉项）。")
+        print("结论模板：'ERP 已触及极端低估'这个判断，需要三个选择同时取最宽松的组合才成立；"
+              "换成可复算口径，它可能只是回到中枢。")
+
+
 def _normalize_argv(argv):
     """把 `--opt -0.20,-0.10` 这种以负号开头的取值改写成 `--opt=-0.20,-0.10`，
     否则 argparse 会把它当成新的选项。"""
@@ -321,6 +394,18 @@ def main():
     im.add_argument("--pe-now", type=float, required=True)
     im.add_argument("--g", type=float, required=True, help="假设盈利增速，如 0.12")
     im.set_defaults(func=cmd_implied)
+
+    ep = sub.add_parser("erp", help="股债模型（ERP 通道）")
+    ep.add_argument("--pe", type=float, required=True, help="当前 PE(TTM)")
+    ep.add_argument("--y10", type=float, required=True, help="10Y 国债收益率（百分点），如 1.634")
+    ep.add_argument("--mu", type=float, required=True, help="ERP 均值（百分点，实测滚动窗口），如 5.68")
+    ep.add_argument("--sd", type=float, required=True, help="ERP 标准差（百分点），如 1.19")
+    ep.add_argument("--e", type=float, help="隐含盈利 E（点位 / PE）")
+    ep.add_argument("--level", type=float, help="当前点位；与 --e 二选一，E = level / PE")
+    ep.add_argument("--alt-pe", type=float, help="口径归因：宽松口径的 PE")
+    ep.add_argument("--alt-mu", type=float, help="口径归因：宽松口径的 μ")
+    ep.add_argument("--alt-sd", type=float, help="口径归因：宽松口径的 σ")
+    ep.set_defaults(func=cmd_erp)
 
     args = ap.parse_args(_normalize_argv(sys.argv[1:]))
     args.func(args)
